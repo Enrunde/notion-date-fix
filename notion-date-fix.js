@@ -426,14 +426,24 @@ function saveNewTasks(newNames) {
   let nCluster = 0;
 
   for (const c of clusters) {
-    if (c.items.length < MIN_BATCH) continue;
     if (!c.items.every((x) => x.ts >= cutoff && x.ts <= now + 60000)) continue;
 
-    // 证据①：人工名单命中
+    // ★★★ 2026-11-06 修：批次大小不再作为「一票否决」★★★ ★
+    //   ★ 原逻辑：批次 < MIN_BATCH(3) → 整批 continue ★
+    //   ★ 问题：Notion 分散生成时（每条隔十几分钟），批次凑不满 3 条 ★
+    //     → 名单里的任务也被丢掉 → 日期不修正 ★
+    //     ★ 实测 2026-11-06：拉伸/喝水/冥想/喝天麻粉 各自单独成批 → 全漏 ★
+    //   ★ 改法：证据①（名单）和 ③（多日重复）都是【按标题】判定的 ★
+    //     → 它们不依赖批次规模 → 批次再小也认 ★
+    //   ★ 只有证据②（冻结特征）需要整批一起看 → 它才受批次规模限制 ★
+
+    // 证据①：人工名单命中（★ 不受批次大小限制 ★）
     const byName = c.items.some((x) => KNOWN_TASKS.indexOf(x.title) >= 0);
     // 证据②：冻结特征（整批日期整齐停在同一天，且 ≠ 生成日）
-    const byFrozen = frozenFeature(c);
+    //   ★ 这个证据必须整批一起看 → 批次太小时不成立 ★
+    const byFrozen = c.items.length >= MIN_BATCH && frozenFeature(c);
     // 证据③：这一批里的标题出现在多个不同生成日 → 它本身就是重复任务
+    //   ★ 同样按标题判定 → 不受批次大小限制 ★
     const byRecurring = c.items.some((x) => isRecurringTitle(titleGenDays, x.title));
 
     if (!byName && !byFrozen && !byRecurring) continue;
@@ -454,8 +464,9 @@ function saveNewTasks(newNames) {
   console.log("读到条目 " + rows.length + " 条");
   console.log("批次识别：" + clusters.length + " 批 → 认定为自动生成 " + nCluster +
     " 批（" + autoIds.size + " 条）");
-  console.log("  名单 " + KNOWN_TASKS.length + " 个 · 最小批次 " + MIN_BATCH +
+  console.log("  名单 " + KNOWN_TASKS.length + " 个 · 冻结特征需批次 ≥ " + MIN_BATCH +
     " · 间隔 " + (CLUSTER_GAP / 60000) + " 分钟");
+  console.log("  ★ 名单 / 多日重复 按标题判定 → 不受批次大小限制 ★");
   console.log("");
 
   // ── 逐条判定 ──
