@@ -30,7 +30,14 @@
  *   node notion-date-fix.js                  # 干跑：只报告，不写
  *   node notion-date-fix.js --执行           # 真改
  *   node notion-date-fix.js --执行 --库=全局  # 换库
- *   node notion-date-fix.js --执行 --回溯=60 # 扫描最近 60 天
+ *   node notion-date-fix.js --执行 --回溯=7  # 应急：补齐最近 7 天漏跑的
+ *
+ * ★★★ 处理范围（2026-11-06 按用户要求收窄）★★★ ★
+ *   默认（--回溯=0）→ 【只处理今天生成的条目】★★
+ *     · 判定：生成日 == 今天（北京时区）★
+ *     · 只改「日期 < 生成日」的（过期的）→ 未来的不动 ★
+ *     · ★ 精准、不扫历史、不误伤 ★
+ *   应急：某天云端跑挂了 → 手动 --回溯=7 补那一周 ★
  *
  * 环境变量
  *   NOTION_TOKEN   Notion 集成令牌（云端必填；本地可省略，走 ~/.config/notion/token）
@@ -76,7 +83,14 @@ const val = (f, d) => {
 
 const DRY = !has("--执行");
 const LIB_NAME = val("--库", CFG.库 || "工作");
-const DAYS = parseInt(val("--回溯", "30"), 10) || 30;
+/**
+ * ★★★ 扫描范围 ★★★
+ *   默认 0 = 【只处理今天生成的条目】★★ ★
+ *   ★ 2026-11-06 用户要求：「范围固定在当天生成的，别扫太大的范围」★
+ *   ★ 精准：只动今天的 → 不会误伤历史条目 ★
+ *   ★ 应急补齐：某天云端跑挂了 → 手动 --回溯=7 补那一周 ★
+ */
+const DAYS = parseInt(val("--回溯", "0"), 10) || 0;
 const BACKFILL = val("--回补", "");
 
 // ─────────────────────────────────────────────
@@ -278,8 +292,12 @@ function clusterByCreation(items) {
 function computeTarget(cur, genDay) {
   if (!cur || !cur.start) return null;
   const src = parseDateVal(cur.start);
+  // ★★★ 2026-11-06：只修【过期】的（日期 < 生成日）★★★ ★
+  //   ★ 日期已经等于生成日 → 正确，不动 ✔
+  //   ★ 日期晚于生成日（未来）→ 不动（那不是「过期」，强行改反而错）★
+  //   ★ 以前是「≠ 就改」→ 会把未来日期也拉回今天 → 过度修正 ★
+  if (src.day >= genDay) return null;
   if (!src.hasTime) {
-    if (src.day === genDay) return null;
     return { start: genDay, label: genDay + "（纯日期）" };
   }
   const target = bjToIso(genDay, src.hm);
@@ -377,7 +395,7 @@ function saveNewTasks(newNames) {
   console.log("══════════════════════════════════════════════════════════");
   console.log("  Notion 重复任务日期自动修正 · " + (DRY ? "【干跑】只报告" : "【执行】会真实写入"));
   console.log("  库：" + lib.label);
-  console.log("  扫描范围：最近 " + DAYS + " 天（漏跑也能补齐）");
+  console.log("  扫描范围：" + (DAYS === 0 ? "★ 只今天生成的条目（精准模式）" : "最近 " + DAYS + " 天（应急补齐）"));
   console.log("══════════════════════════════════════════════════════════\n");
 
   let rows;
@@ -394,7 +412,19 @@ function saveNewTasks(newNames) {
 
   const { titleKey, dateKey } = await readSchema();
   const now = Date.now();
-  const cutoff = now - DAYS * 86400000;
+  // ★★★ 2026-11-06：cutoff 必须是【范围内起始那天的 00:00】★★★ ★
+  //   ★ 原来 cutoff = now - DAYS*86400000 ★
+  //   ★ DAYS=0 时 cutoff = now → 今天生成的条目全都早于 now → 被全排除！★
+  //   → 自动生成 0 批 → 什么都不改 ★
+  //   → 正确做法：从「范围内最早的那一天 00:00」开始 ★
+  const todayBJ = bj(new Date(now).toISOString()).day;
+  const allowedGenDays = new Set();
+  for (let i = 0; i <= DAYS; i++) {
+    // ★ bj() 要 ISO 字符串，直接传数字会得到 NaN ★
+    allowedGenDays.add(bj(new Date(now - i * 86400000).toISOString()).day);
+  }
+  const earliestDay = [...allowedGenDays].sort()[0];
+  const cutoff = parseTs(bjToIso(earliestDay, "00:00"));
 
   const items = rows.map((p) => {
     const props = p.properties || {};
@@ -427,6 +457,9 @@ function saveNewTasks(newNames) {
 
   for (const c of clusters) {
     if (!c.items.every((x) => x.ts >= cutoff && x.ts <= now + 60000)) continue;
+    // ★★★ 范围限定：这一批必须在【允许的生成日】里 ★★★
+    //   ★ 默认（回溯=0）→ 只有今天生成的才处理 → 精准、不碰历史条目 ★
+    if (!c.items.every((x) => allowedGenDays.has(x.genDay))) continue;
 
     // ★★★ 2026-11-06 修：批次大小不再作为「一票否决」★★★ ★
     //   ★ 原逻辑：批次 < MIN_BATCH(3) → 整批 continue ★
@@ -467,14 +500,18 @@ function saveNewTasks(newNames) {
   console.log("  名单 " + KNOWN_TASKS.length + " 个 · 冻结特征需批次 ≥ " + MIN_BATCH +
     " · 间隔 " + (CLUSTER_GAP / 60000) + " 分钟");
   console.log("  ★ 名单 / 多日重复 按标题判定 → 不受批次大小限制 ★");
+  console.log("  ★★ 扫描范围：生成日 ∈ {" + [...allowedGenDays].sort().join(", ") + "}" +
+    (DAYS === 0 ? "（只今天）" : "（回溯 " + DAYS + " 天）"));
   console.log("");
 
   // ── 逐条判定 ──
   const plan = [];
-  const stats = { 已正确: 0, 非批次: 0, 排除: 0, 无日期: 0, 未来: 0 };
+  const stats = { 已正确: 0, 非批次: 0, 排除: 0, 无日期: 0, 未来: 0, 范围外: 0 };
 
   for (const it of items) {
     if (!it.dv || !it.dv.start) { stats.无日期++; continue; }
+    // ★★★ 范围外（生成日不在允许集合）→ 直接跳过，不进任何统计噪音 ★★★
+    if (!allowedGenDays.has(it.genDay)) { stats.范围外++; continue; }
     if (!autoIds.has(it.id)) { stats.非批次++; continue; }
     if (it.ts > now + 60000) { stats.未来++; continue; }
     if (EXCLUDED.indexOf(it.title) >= 0) { stats.排除++; continue; }
@@ -493,10 +530,11 @@ function saveNewTasks(newNames) {
 
   // ── 报告 ──
   console.log("──────────────────────────────────────────────────────────");
-  console.log("扫描 " + rows.length + " 条 ｜ 自动生成 " + autoIds.size +
+  console.log("扫描 " + rows.length + " 条 ｜ 范围内自动生成 " + autoIds.size +
     " ｜ 需修正 " + plan.length);
   console.log("  已正确 " + stats.已正确 + " ｜ 非自动生成 " + stats.非批次 +
-    " ｜ 显式排除 " + stats.排除 + " ｜ 无日期 " + stats.无日期);
+    " ｜ 显式排除 " + stats.排除 + " ｜ 无日期 " + stats.无日期 +
+    " ｜ 范围外 " + stats.范围外);
   console.log("──────────────────────────────────────────────────────────");
 
   if (plan.length) {
