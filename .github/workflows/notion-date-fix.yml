@@ -1,0 +1,47 @@
+name: Notion 重复任务日期自动修正
+
+# ★ 每天北京时间凌晨 3:10 自动跑一次
+#   GitHub Actions 的 cron 用 UTC：北京时间 3:10 = UTC 前一天 19:10
+#   写成 "10 19 * * *" = 每天 UTC 19:10 = 北京时间次日 03:10
+on:
+  schedule:
+    - cron: "10 19 * * *"
+  # 也能在网页上手动点一下跑
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v5
+
+      - name: 设定 Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: 修正 Notion 重复任务日期
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: node notion-date-fix.js --执行
+
+      - name: 提交自学习到的任务名
+        # 脚本发现新的重复任务名时会写回配置，这里提交回仓库
+        # （失败不影响主流程，忽略即可）
+        continue-on-error: true
+        run: |
+          if git diff --quiet -- notion-date-fix.config.json; then
+            echo "配置无变化，无需提交"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add notion-date-fix.config.json
+            git commit -m "chore: 自动记录新发现的重复任务名"
+            git push
+          fi
